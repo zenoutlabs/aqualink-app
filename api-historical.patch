@@ -1,0 +1,468 @@
+--- a/packages/api/src/sites/dto/filter-site.dto.ts
++++ b/packages/api/src/sites/dto/filter-site.dto.ts
+@@ -9,8 +9,9 @@
+ import { Type } from 'class-transformer';
+ import { ApiProperty } from '@nestjs/swagger';
+ import { SiteStatus } from '../sites.entity';
++import { HistoricalDateDto } from './historical-date.dto';
+ 
+-export class FilterSiteDto {
++export class FilterSiteDto extends HistoricalDateDto {
+   @ApiProperty({ example: 'Duxbury Site' })
+   @IsOptional()
+   @IsString()
+--- /dev/null
++++ b/packages/api/src/sites/dto/historical-date.dto.ts
+@@ -0,0 +1,14 @@
++import { ApiPropertyOptional } from '@nestjs/swagger';
++import { IsOptional, IsString, Matches } from 'class-validator';
++
++export class HistoricalDateDto {
++  @ApiPropertyOptional({
++    example: '2024-01-02',
++    description:
++      'UTC calendar date for an exact-day historical snapshot. Omit for live data.',
++  })
++  @IsOptional()
++  @IsString()
++  @Matches(/^\d{4}-\d{2}-\d{2}$/)
++  readonly date?: string;
++}
+--- a/packages/api/src/sites/sites.controller.ts
++++ b/packages/api/src/sites/sites.controller.ts
+@@ -21,6 +21,7 @@
+ import { SitesService } from './sites.service';
+ import { Site } from './sites.entity';
+ import { FilterSiteDto } from './dto/filter-site.dto';
++import { HistoricalDateDto } from './dto/historical-date.dto';
+ import { UpdateSiteDto } from './dto/update-site.dto';
+ import { AdminLevel } from '../users/users.entity';
+ import { Auth } from '../auth/auth.decorator';
+@@ -73,8 +74,11 @@
+   @ApiParam({ name: 'id', example: 1 })
+   @Public()
+   @Get(':id')
+-  findOne(@Param('id', ParseIntPipe) id: number): Promise<Site> {
+-    return this.sitesService.findOne(id);
++  findOne(
++    @Param('id', ParseIntPipe) id: number,
++    @Query() historicalDate: HistoricalDateDto,
++  ): Promise<Site> {
++    return this.sitesService.findOne(id, historicalDate.date);
+   }
+ 
+   @ApiNestNotFoundResponse('No site was found with the specified id')
+--- a/packages/api/src/sites/sites.entity.ts
++++ b/packages/api/src/sites/sites.entity.ts
+@@ -175,6 +175,20 @@
+ 
+   collectionData?: CollectionDataDto;
+ 
++  @ApiPropertyOptional({
++    example: '2024-01-02',
++    description: 'Requested UTC day. Present only for historical snapshots.',
++  })
++  historicalDate?: string;
++
++  @ApiPropertyOptional({
++    example: '2024-01-02T23:59:59.999Z',
++    nullable: true,
++    description:
++      'Actual daily snapshot timestamp, or null if that day has no record.',
++  })
++  historicalObservedAt?: string | null;
++
+   maskedSpotterApiToken?: string;
+ 
+   waterQualitySources?: string[];
+--- a/packages/api/src/sites/sites.service.ts
++++ b/packages/api/src/sites/sites.service.ts
+@@ -52,6 +52,10 @@
+ import { TimeSeries } from '../time-series/time-series.entity';
+ import { sendSlackMessage, SlackMessage } from '../utils/slack.utils';
+ import { ScheduledUpdate } from './scheduled-updates.entity';
++import {
++  getHistoricalSiteData,
++  parseHistoricalDay,
++} from '../utils/historical-site-data';
+ 
+ @Injectable()
+ export class SitesService {
+@@ -156,6 +160,7 @@
+   }
+ 
+   async find(filter: FilterSiteDto): Promise<Site[]> {
++    const historicalDay = parseHistoricalDay(filter.date);
+     const query = this.sitesRepository.createQueryBuilder('site');
+ 
+     if (filter.name) {
+@@ -198,10 +203,16 @@
+       .andWhere('display = true')
+       .getMany();
+ 
+-    const mappedSiteData = await getCollectionData(
+-      res,
+-      this.latestDataRepository,
+-    );
++    const historicalData = historicalDay
++      ? await getHistoricalSiteData(
++          res.map((site) => site.id),
++          historicalDay,
++          this.dailyDataRepository,
++        )
++      : undefined;
++    const mappedSiteData = historicalDay
++      ? {}
++      : await getCollectionData(res, this.latestDataRepository);
+ 
+     const hasHoboDataSet = await hasHoboDataSubQuery(this.sourceRepository);
+ 
+@@ -216,14 +227,21 @@
+     return res.map((site) => ({
+       ...site,
+       applied: site.applied,
+-      collectionData: mappedSiteData[site.id],
++      collectionData: historicalDay
++        ? (historicalData?.[site.id]?.collectionData ?? {})
++        : mappedSiteData[site.id],
++      ...(historicalDay && {
++        historicalDate: historicalDay.date,
++        historicalObservedAt: historicalData?.[site.id]?.observedAt ?? null,
++      }),
+       hasHobo: hasHoboDataSet.has(site.id),
+       waterQualitySources: waterQualityDataSet.get(site.id),
+       reefCheckData: reefCheckDataSet[site.id],
+     }));
+   }
+ 
+-  async findOne(id: number): Promise<Site> {
++  async findOne(id: number, date?: string): Promise<Site> {
++    const historicalDay = parseHistoricalDay(date);
+     const site = await getSite(
+       id,
+       this.sitesRepository,
+@@ -244,12 +262,20 @@
+     const surveys = site.surveys || [];
+     const historicalMonthlyMean = site.historicalMonthlyMean || [];
+ 
+-    const videoStream = await this.checkVideoStream(site);
+-
+-    const mappedSiteData = await getCollectionData(
+-      [site],
+-      this.latestDataRepository,
+-    );
++    const videoStream = historicalDay
++      ? null
++      : await this.checkVideoStream(site);
++
++    const historicalData = historicalDay
++      ? await getHistoricalSiteData(
++          [site.id],
++          historicalDay,
++          this.dailyDataRepository,
++        )
++      : undefined;
++    const mappedSiteData = historicalDay
++      ? {}
++      : await getCollectionData([site], this.latestDataRepository);
+ 
+     const maskedSpotterApiToken = site.spotterApiToken
+       ? `****${site.spotterApiToken?.slice(-4)}`
+@@ -280,7 +306,13 @@
+       historicalMonthlyMean,
+       videoStream,
+       applied: site.applied,
+-      collectionData: mappedSiteData[site.id],
++      collectionData: historicalDay
++        ? (historicalData?.[site.id]?.collectionData ?? {})
++        : mappedSiteData[site.id],
++      ...(historicalDay && {
++        historicalDate: historicalDay.date,
++        historicalObservedAt: historicalData?.[site.id]?.observedAt ?? null,
++      }),
+     };
+   }
+ 
+--- /dev/null
++++ b/packages/api/src/utils/historical-site-data.ts
+@@ -0,0 +1,94 @@
++import { BadRequestException } from '@nestjs/common';
++import { DateTime } from 'luxon';
++import { Repository } from 'typeorm';
++import { CollectionDataDto } from '../collections/dto/collection-data.dto';
++import { DailyData } from '../sites/daily-data.entity';
++
++export interface HistoricalDay {
++  date: string;
++  start: Date;
++  end: Date;
++}
++
++export function parseHistoricalDay(date?: string): HistoricalDay | undefined {
++  if (date === undefined) return undefined;
++
++  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
++    throw new BadRequestException('Date must be a valid YYYY-MM-DD UTC date');
++  }
++  const day = DateTime.fromISO(date, { zone: 'UTC' });
++  if (!day.isValid || day.year < 1 || day.toISODate() !== date) {
++    throw new BadRequestException('Date must be a valid YYYY-MM-DD UTC date');
++  }
++  if (day > DateTime.utc().startOf('day')) {
++    throw new BadRequestException('Date must not be in the future');
++  }
++  return {
++    date,
++    start: day.toJSDate(),
++    end: day.plus({ days: 1 }).toJSDate(),
++  };
++}
++
++interface DailySnapshotRow {
++  siteId: number;
++  observedAt: Date;
++  satelliteTemperature: number | null;
++  degreeHeatingDays: number | null;
++  dailyAlertLevel: number | null;
++  weeklyAlertLevel: number | null;
++}
++
++export interface HistoricalSnapshot {
++  collectionData: CollectionDataDto;
++  observedAt: string;
++}
++
++/** Read all requested sites in one query, without falling back to another day. */
++export async function getHistoricalSiteData(
++  siteIds: number[],
++  day: HistoricalDay,
++  dailyDataRepository: Repository<DailyData>,
++): Promise<Record<number, HistoricalSnapshot>> {
++  if (!siteIds.length) return {};
++
++  const rows = await dailyDataRepository
++    .createQueryBuilder('daily_data')
++    .select('daily_data.site_id', 'siteId')
++    .addSelect('daily_data.date', 'observedAt')
++    .addSelect('daily_data.satellite_temperature', 'satelliteTemperature')
++    .addSelect('daily_data.degree_heating_days', 'degreeHeatingDays')
++    .addSelect('daily_data.daily_alert_level', 'dailyAlertLevel')
++    .addSelect('daily_data.weekly_alert_level', 'weeklyAlertLevel')
++    .distinctOn(['daily_data.site_id'])
++    .where('daily_data.site_id IN (:...siteIds)', { siteIds })
++    .andWhere('daily_data.date >= :start', { start: day.start })
++    .andWhere('daily_data.date < :end', { end: day.end })
++    .orderBy('daily_data.site_id', 'ASC')
++    .addOrderBy('daily_data.date', 'DESC')
++    .addOrderBy('daily_data.id', 'DESC')
++    .getRawMany<DailySnapshotRow>();
++
++  return Object.fromEntries(
++    rows.map((row) => [
++      row.siteId,
++      {
++        observedAt: row.observedAt.toISOString(),
++        collectionData: {
++          ...(row.satelliteTemperature !== null && {
++            satelliteTemperature: row.satelliteTemperature,
++          }),
++          ...(row.degreeHeatingDays !== null && {
++            dhw: row.degreeHeatingDays / 7,
++          }),
++          ...(row.dailyAlertLevel !== null && {
++            tempAlert: row.dailyAlertLevel,
++          }),
++          ...(row.weeklyAlertLevel !== null && {
++            tempWeeklyAlert: row.weeklyAlertLevel,
++          }),
++        },
++      },
++    ]),
++  );
++}
+--- a/packages/api/test/aqualink-preflight.test.ts
++++ b/packages/api/test/aqualink-preflight.test.ts
+@@ -1,4 +1,4 @@
+-// Local readiness check only. This file does not implement issue #1162.
++// Credential-free baseline and historical snapshot regression tests.
+ import 'reflect-metadata';
+ import { INestApplication } from '@nestjs/common';
+ import { Test } from '@nestjs/testing';
+@@ -151,12 +151,22 @@
+         date: new Date('2024-01-02T23:59:59.999Z'),
+         satelliteTemperature: 23,
+         dailyAlertLevel: 1,
++        weeklyAlertLevel: 4,
++        degreeHeatingDays: 14,
+       },
+       {
+         site: primarySite,
+         date: new Date('2024-01-03T00:00:00.000Z'),
+         satelliteTemperature: 24,
+         dailyAlertLevel: 2,
++      },
++      {
++        site: primarySite,
++        date: new Date('2024-01-04T00:00:00.000Z'),
++        satelliteTemperature: 0,
++        degreeHeatingDays: 0,
++        dailyAlertLevel: 0,
++        weeklyAlertLevel: 0,
+       },
+       {
+         site: otherSite,
+@@ -235,6 +245,154 @@
+       '/sites/not-an-integer/daily_data',
+     );
+     expect(response.status).toBe(400);
++  });
++
++  it('returns the last exact-day snapshot with converted heat stress', async () => {
++    const response = await request(app!.getHttpServer())
++      .get(`/sites/${siteId}`)
++      .query({ date: '2024-01-02' });
++    expect(response.status).toBe(200);
++    expect(response.body.historicalDate).toBe('2024-01-02');
++    expect(response.body.historicalObservedAt).toBe('2024-01-02T23:59:59.999Z');
++    expect(response.body.collectionData).toEqual({
++      satelliteTemperature: 23,
++      dhw: 2,
++      tempAlert: 1,
++      tempWeeklyAlert: 4,
++    });
++    expect(response.body.videoStream).toBeNull();
++  });
++
++  it('includes UTC midnight and preserves all zero measurements', async () => {
++    const response = await request(app!.getHttpServer())
++      .get(`/sites/${siteId}`)
++      .query({ date: '2024-01-04' });
++    expect(response.status).toBe(200);
++    expect(response.body.historicalObservedAt).toBe('2024-01-04T00:00:00.000Z');
++    expect(response.body.collectionData).toEqual({
++      satelliteTemperature: 0,
++      dhw: 0,
++      tempAlert: 0,
++      tempWeeklyAlert: 0,
++    });
++  });
++
++  it('omits null measurements instead of treating them as zero', async () => {
++    const response = await request(app!.getHttpServer())
++      .get(`/sites/${otherSiteId}`)
++      .query({ date: '2024-01-02' });
++    expect(response.status).toBe(200);
++    expect(response.body.historicalObservedAt).toBe('2024-01-02T12:00:00.000Z');
++    expect(response.body.collectionData).toEqual({ satelliteTemperature: 31 });
++  });
++
++  it('does not fall back to an older day when the requested day is empty', async () => {
++    const response = await request(app!.getHttpServer())
++      .get(`/sites/${siteId}`)
++      .query({ date: '2024-01-05' });
++    expect(response.status).toBe(200);
++    expect(response.body.historicalDate).toBe('2024-01-05');
++    expect(response.body.historicalObservedAt).toBeNull();
++    expect(response.body.collectionData).toEqual({});
++  });
++
++  it('keeps the same snapshot contract on list and detail with one batched query', async () => {
++    const queryLog = jest.spyOn(dataSource.logger, 'logQuery');
++    try {
++      const response = await request(app!.getHttpServer())
++        .get('/sites')
++        .query({ name: 'Local preflight', date: '2024-01-02' });
++      expect(response.status).toBe(200);
++      const primary = response.body.find((site) => site.id === siteId);
++      const other = response.body.find((site) => site.id === otherSiteId);
++      expect(primary.historicalDate).toBe('2024-01-02');
++      expect(primary.historicalObservedAt).toBe('2024-01-02T23:59:59.999Z');
++      expect(primary.collectionData).toEqual({
++        satelliteTemperature: 23,
++        dhw: 2,
++        tempAlert: 1,
++        tempWeeklyAlert: 4,
++      });
++      expect(other.historicalObservedAt).toBe('2024-01-02T12:00:00.000Z');
++      expect(other.collectionData).toEqual({ satelliteTemperature: 31 });
++      const snapshotQueries = queryLog.mock.calls.filter(([sql]) =>
++        /FROM "daily_data"/.test(sql),
++      );
++      expect(snapshotQueries).toHaveLength(1);
++    } finally {
++      queryLog.mockRestore();
++    }
++  });
++
++  it('returns explicit missing-day metadata for every site in a list', async () => {
++    const response = await request(app!.getHttpServer())
++      .get('/sites')
++      .query({ name: 'Local preflight', date: '2024-01-05' });
++    expect(response.status).toBe(200);
++    expect(response.body).toHaveLength(2);
++    response.body.forEach((site) => {
++      expect(site.historicalDate).toBe('2024-01-05');
++      expect(site.historicalObservedAt).toBeNull();
++      expect(site.collectionData).toEqual({});
++    });
++  });
++
++  it('keeps historical metadata absent when date is omitted', async () => {
++    await Promise.all(
++      ['/sites', `/sites/${siteId}`].map(async (path) => {
++        const response = await request(app!.getHttpServer()).get(path);
++        expect(response.status).toBe(200);
++        const rows = Array.isArray(response.body)
++          ? response.body
++          : [response.body];
++        rows.forEach((site) => {
++          expect(site).not.toHaveProperty('historicalDate');
++          expect(site).not.toHaveProperty('historicalObservedAt');
++        });
++      }),
++    );
++  });
++
++  it.each([
++    'date=',
++    'date=not-a-date',
++    'date=2024-02-30',
++    'date=2023-02-29',
++    'date=0000-01-01',
++    'date=2024-1-02',
++    'date=2024-01-02T00%3A00%3A00Z',
++    'date=2024-01-02&date=2024-01-03',
++    'date%5B%5D=2024-01-02',
++    'date=9999-12-31',
++  ])(
++    'rejects malformed, repeated or future dates on both routes: %s',
++    async (query) => {
++      await Promise.all(
++        ['/sites', `/sites/${siteId}`].map(async (path) => {
++          const response = await request(app!.getHttpServer()).get(
++            `${path}?${query}`,
++          );
++          expect(response.status).toBe(400);
++        }),
++      );
++    },
++  );
++
++  it('accepts leap days and preserves the explicit empty-day response', async () => {
++    const response = await request(app!.getHttpServer())
++      .get(`/sites/${siteId}`)
++      .query({ date: '2024-02-29' });
++    expect(response.status).toBe(200);
++    expect(response.body.historicalDate).toBe('2024-02-29');
++    expect(response.body.historicalObservedAt).toBeNull();
++    expect(response.body.collectionData).toEqual({});
++  });
++
++  it('keeps missing-site errors for historical detail requests', async () => {
++    const response = await request(app!.getHttpServer())
++      .get('/sites/2147483647')
++      .query({ date: '2024-01-02' });
++    expect(response.status).toBe(404);
+   });
+ 
+   afterAll(async () => {
