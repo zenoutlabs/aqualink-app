@@ -1,3 +1,20 @@
+--- /dev/null
++++ b/packages/api/src/pipes/historical-date-query.pipe.ts
+@@ -0,0 +1,14 @@
++import { BadRequestException, Injectable, PipeTransform } from '@nestjs/common';
++import { HistoricalDateDto } from '../sites/dto/historical-date.dto';
++
++@Injectable()
++export class HistoricalDateQueryPipe implements PipeTransform {
++  transform(value: HistoricalDateDto): HistoricalDateDto {
++    // The simple query parser preserves bracket notation as literal keys.
++    // Reject it instead of silently treating an optional date as omitted.
++    if (Object.keys(value).some((key) => key.startsWith('date['))) {
++      throw new BadRequestException('Date must be one YYYY-MM-DD UTC date');
++    }
++    return value;
++  }
++}
 --- a/packages/api/src/sites/dto/filter-site.dto.ts
 +++ b/packages/api/src/sites/dto/filter-site.dto.ts
 @@ -9,8 +9,9 @@
@@ -38,7 +55,26 @@
  import { UpdateSiteDto } from './dto/update-site.dto';
  import { AdminLevel } from '../users/users.entity';
  import { Auth } from '../auth/auth.decorator';
-@@ -73,8 +74,11 @@
+@@ -28,6 +29,7 @@
+ import { CreateSiteApplicationDto, CreateSiteDto } from './dto/create-site.dto';
+ import { IsSiteAdminGuard } from '../auth/is-site-admin.guard';
+ import { ParseDatePipe } from '../pipes/parse-date.pipe';
++import { HistoricalDateQueryPipe } from '../pipes/historical-date-query.pipe';
+ import { DeploySpotterDto } from './dto/deploy-spotter.dto';
+ import { ExcludeSpotterDatesDto } from './dto/exclude-spotter-dates.dto';
+ import { ExclusionDates } from './exclusion-dates.entity';
+@@ -64,7 +66,9 @@
+   @ApiOperation({ summary: 'Returns sites filtered by provided filters' })
+   @Public()
+   @Get()
+-  find(@Query() filterSiteDto: FilterSiteDto): Promise<Site[]> {
++  find(
++    @Query(HistoricalDateQueryPipe) filterSiteDto: FilterSiteDto,
++  ): Promise<Site[]> {
+     return this.sitesService.find(filterSiteDto);
+   }
+ 
+@@ -73,8 +77,11 @@
    @ApiParam({ name: 'id', example: 1 })
    @Public()
    @Get(':id')
@@ -46,7 +82,7 @@
 -    return this.sitesService.findOne(id);
 +  findOne(
 +    @Param('id', ParseIntPipe) id: number,
-+    @Query() historicalDate: HistoricalDateDto,
++    @Query(HistoricalDateQueryPipe) historicalDate: HistoricalDateDto,
 +  ): Promise<Site> {
 +    return this.sitesService.findOne(id, historicalDate.date);
    }
@@ -311,7 +347,7 @@
        },
        {
          site: otherSite,
-@@ -235,6 +245,154 @@
+@@ -235,6 +245,157 @@
        '/sites/not-an-integer/daily_data',
      );
      expect(response.status).toBe(400);
@@ -433,6 +469,9 @@
 +    'date=2024-01-02T00%3A00%3A00Z',
 +    'date=2024-01-02&date=2024-01-03',
 +    'date%5B%5D=2024-01-02',
++    'date%5B0%5D=2024-01-02',
++    'date%5Byear%5D=2024',
++    'date=2024-01-02&date%5B%5D=2024-01-03',
 +    'date=9999-12-31',
 +  ])(
 +    'rejects malformed, repeated or future dates on both routes: %s',
