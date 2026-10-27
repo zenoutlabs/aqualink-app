@@ -27,6 +27,8 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 12
     steps:
       - uses: actions/checkout@v4
+      - name: Apply exact candidate API changes
+        run: git apply --check api-historical.patch && git apply api-historical.patch
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
